@@ -16,11 +16,22 @@ import java.net.URLDecoder
 class CloudExtractor(private val client: OkHttpClient, private val headers: Headers) {
 
     private val json = Json { ignoreUnknownKeys = true }
+    private val initializedHosts = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     fun getEpisodesFromCloudUrl(cloudUrl: String, prefix: String = ""): List<SEpisode> {
         val (baseUrl, segments) = splitUrl(cloudUrl)
         val initialUrl = urlToBase64(baseUrl, segments)
         val episodes = mutableListOf<SEpisode>()
+
+        // drive.animetoki.com requires a session cookie which is set on GET request to root domain
+        if (baseUrl.contains("drive.animetoki.com") && initializedHosts.add(baseUrl)) {
+            try {
+                client.newCall(eu.kanade.tachiyomi.network.GET("$baseUrl/", headers)).execute().close()
+            } catch (e: Exception) {
+                Log.e("AnimeToki", "Failed preliminary GET for session cookie: $baseUrl/", e)
+            }
+        }
+
         traverseFolder(baseUrl, initialUrl, episodes, floatArrayOf(1f), prefix)
         return episodes
     }
@@ -67,21 +78,17 @@ class CloudExtractor(private val client: OkHttpClient, private val headers: Head
     private fun traverseFolder(baseUrl: String, folderUrl: String, episodes: MutableList<SEpisode>, epCounter: FloatArray, prefix: String = "") {
         var responseBody: String? = null
         try {
-            // drive.animetoki.com requires a session cookie which is set on GET request
-            if (folderUrl.contains("drive.animetoki.com")) {
-                try {
-                    client.newCall(eu.kanade.tachiyomi.network.GET(folderUrl, headers)).execute().close()
-                } catch (e: Exception) {
-                    Log.e("AnimeToki", "Failed preliminary GET for session cookie: $folderUrl", e)
-                }
-            }
-
             for (i in 1..3) {
                 try {
                     client.newCall(POST(folderUrl, headers)).execute().use { response ->
                         if (response.isSuccessful) {
-                            responseBody = response.body.string()
-                            break
+                            val body = response.body.string()
+                            if (body.startsWith("{")) {
+                                responseBody = body
+                                break
+                            } else if (i < 3 && baseUrl.contains("drive.animetoki.com")) {
+                                client.newCall(eu.kanade.tachiyomi.network.GET("$baseUrl/", headers)).execute().close()
+                            }
                         }
                     }
                 } catch (e: Exception) {

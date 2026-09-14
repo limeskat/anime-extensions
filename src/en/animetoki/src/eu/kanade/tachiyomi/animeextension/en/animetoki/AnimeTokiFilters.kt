@@ -9,11 +9,14 @@ object AnimeTokiFilters {
         fun toUriPart() = vals[state].second
     }
 
-    class GenreFilter :
+    class CategoryFilter :
         UriPartFilter(
-            "Genre",
+            "Category",
             arrayOf(
-                Pair("Any", ""),
+                Pair("All", ""),
+                Pair("Anime Series", "anime-series"),
+                Pair("Ongoing Anime", "ongoing-anime"),
+                Pair("Anime Movies", "anime-movies"),
                 Pair("Action", "action"),
                 Pair("Adventure", "adventure"),
                 Pair("Comedy", "comedy"),
@@ -37,19 +40,7 @@ object AnimeTokiFilters {
             ),
         )
 
-    class SubPageFilter :
-        UriPartFilter(
-            "Sub-page",
-            arrayOf(
-                Pair("Any", ""),
-                Pair("Anime Series", "anime-series"),
-                Pair("Ongoing Anime", "ongoing-anime"),
-                Pair("Anime Movies", "anime-movies"),
-            ),
-        )
-
     fun getFilterList(): AnimeFilterList = AnimeFilterList(
-        SubPageFilter(),
-        GenreFilter(),
+        CategoryFilter(),
     )
 }
