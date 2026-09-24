@@ -8,7 +8,13 @@ import eu.kanade.tachiyomi.animesource.model.SEpisode
 import keiyoushi.utils.get
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.post
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.Headers
 import okhttp3.OkHttpClient
@@ -20,10 +26,13 @@ class CloudExtractor(private val client: OkHttpClient, private val headers: Head
 
     private val initializedHosts = ConcurrentHashMap.newKeySet<String>()
 
+    // Single drive folder listings can take ~1min server-side; fetch subfolders
+    // concurrently instead of one POST at a time.
+    private val fetchSemaphore = Semaphore(5)
+
     suspend fun getEpisodesFromCloudUrl(cloudUrl: String, prefix: String = ""): List<SEpisode> {
         val (baseUrl, segments) = splitUrl(cloudUrl)
         val initialUrl = urlToBase64(baseUrl, segments)
-        val episodes = mutableListOf<SEpisode>()
 
         // drive.animetoki.com requires a session cookie which is set on GET request to root domain
         if (baseUrl.contains("drive.animetoki.com") && initializedHosts.add(baseUrl)) {
@@ -34,8 +43,9 @@ class CloudExtractor(private val client: OkHttpClient, private val headers: Head
             }
         }
 
-        traverseFolder(baseUrl, initialUrl, episodes, floatArrayOf(1f), prefix)
-        return episodes
+        return traverseFolder(baseUrl, initialUrl, prefix)
+            .sortedWith { a, b -> naturalCompare(a.name, b.name) }
+            .mapIndexed { index, episode -> episode.apply { episode_number = (index + 1).toFloat() } }
     }
 
     private fun encode2Base64(s: String): String = Base64.encodeToString(URLDecoder.decode(s, "UTF-8").toByteArray(), Base64.DEFAULT or Base64.NO_WRAP)
@@ -77,64 +87,80 @@ class CloudExtractor(private val client: OkHttpClient, private val headers: Head
         }
     }
 
-    private suspend fun traverseFolder(baseUrl: String, folderUrl: String, episodes: MutableList<SEpisode>, epCounter: FloatArray, prefix: String = "") {
-        var responseBody: String? = null
-        try {
-            for (i in 1..3) {
-                try {
-                    client.post(folderUrl, headers).use { response ->
-                        if (response.isSuccessful) {
-                            val body = response.body.string()
-                            if (body.trimStart().startsWith("{")) {
-                                responseBody = body
-                                break
-                            } else if (i < 3 && baseUrl.contains("drive.animetoki.com")) {
-                                client.get("$baseUrl/", headers).close()
-                            }
-                        }
-                    }
-                } catch (e: Exception) {
-                    if (i == 3) throw e
-                    delay(1000.milliseconds)
-                }
-            }
-            if (responseBody.isNullOrEmpty()) {
-                Log.e("AnimeToki", "Failed to fetch cloud folder after 3 retries: $folderUrl")
-                return
-            }
+    private suspend fun traverseFolder(baseUrl: String, folderUrl: String, prefix: String = ""): List<SEpisode> = coroutineScope {
+        val responseBody = fetchFolderWithRetry(baseUrl, folderUrl) ?: return@coroutineScope emptyList()
 
-            val responseObj = responseBody.parseAs<CloudFileResponse>()
-            val nodeIndex = responseObj.nodeIndex?.jsonPrimitive?.content ?: ""
-
-            val sortedFiles = responseObj.files.sortedWith { a, b -> naturalCompare(a.name, b.name) }
-
-            for (file in sortedFiles) {
-                if (file.actualMimeType.contains("video", ignoreCase = true)) {
-                    val downloadUrl = "$baseUrl/?a=download&id=${file.id}&name=${encode2Base64(file.name)}&n=$nodeIndex"
-                    val episode = SEpisode.create().apply {
-                        val cleanName = file.name.replace("[AnimeToki] ", "", ignoreCase = true)
-                            .replace("[AnimeSakura] ", "", ignoreCase = true).trim()
-                        this.name = cleanName
-                        if (prefix.isNotBlank()) {
-                            this.scanlator = prefix
-                        }
-                        this.url = downloadUrl
-                        this.episode_number = epCounter[0]++
-                    }
-                    episodes.add(episode)
-                } else if (file.actualMimeType.contains("folder", ignoreCase = true)) {
-                    val nextUrl = if (folderUrl.endsWith("/")) {
-                        folderUrl + encode2Base64(file.name) + "/"
-                    } else {
-                        folderUrl + "/" + encode2Base64(file.name) + "/"
-                    }
-                    val newPrefix = if (prefix.isNotBlank()) "$prefix / ${file.name}" else file.name
-                    traverseFolder(baseUrl, nextUrl, episodes, epCounter, newPrefix)
-                }
-            }
+        val responseObj = try {
+            responseBody.parseAs<CloudFileResponse>()
         } catch (e: Exception) {
+            if (e is CancellationException) throw e
             Log.e("AnimeToki", "Error parsing cloud folder: $folderUrl", e)
-            Log.e("AnimeToki", "Response Body: $responseBody")
+            return@coroutineScope emptyList()
         }
+        val nodeIndex = responseObj.nodeIndex?.jsonPrimitive?.content ?: ""
+
+        val sortedFiles = responseObj.files.sortedWith { a, b -> naturalCompare(a.name, b.name) }
+
+        val videos = sortedFiles
+            .filter { it.actualMimeType.contains("video", ignoreCase = true) }
+            .map { file ->
+                SEpisode.create().apply {
+                    val cleanName = file.name.replace("[AnimeToki] ", "", ignoreCase = true)
+                        .replace("[AnimeSakura] ", "", ignoreCase = true).trim()
+                    this.name = cleanName
+                    if (prefix.isNotBlank()) {
+                        this.scanlator = prefix
+                    }
+                    this.url = "$baseUrl/?a=download&id=${file.id}&name=${encode2Base64(file.name)}&n=$nodeIndex"
+                }
+            }
+
+        val subfolders = sortedFiles
+            .filter { it.actualMimeType.contains("folder", ignoreCase = true) }
+            .map { file ->
+                async {
+                    try {
+                        val nextUrl = if (folderUrl.endsWith("/")) {
+                            folderUrl + encode2Base64(file.name) + "/"
+                        } else {
+                            folderUrl + "/" + encode2Base64(file.name) + "/"
+                        }
+                        val newPrefix = if (prefix.isNotBlank()) "$prefix / ${file.name}" else file.name
+                        traverseFolder(baseUrl, nextUrl, newPrefix)
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        Log.e("AnimeToki", "Error traversing cloud folder: ${file.name}", e)
+                        emptyList()
+                    }
+                }
+            }
+            .awaitAll()
+            .flatten()
+
+        videos + subfolders
+    }
+
+    private suspend fun fetchFolderWithRetry(baseUrl: String, folderUrl: String): String? {
+        repeat(3) { attempt ->
+            try {
+                val body = fetchSemaphore.withPermit {
+                    client.post(folderUrl, headers).use { response ->
+                        if (!response.isSuccessful) return@use null
+                        val responseBody = response.body.string()
+                        if (responseBody.trimStart().startsWith("{")) return@use responseBody
+                        if (attempt < 2 && baseUrl.contains("drive.animetoki.com")) {
+                            client.get("$baseUrl/", headers).close()
+                        }
+                        null
+                    }
+                }
+                if (body != null) return body
+            } catch (e: Exception) {
+                if (e is CancellationException || attempt == 2) throw e
+                delay(1000.milliseconds)
+            }
+        }
+        Log.e("AnimeToki", "Failed to fetch cloud folder after 3 retries: $folderUrl")
+        return null
     }
 }

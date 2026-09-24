@@ -15,6 +15,12 @@ import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.get
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.post
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
@@ -22,6 +28,7 @@ import okhttp3.Response
 import org.jsoup.nodes.Element
 import java.net.URLDecoder
 import java.text.Normalizer
+import java.util.concurrent.TimeUnit
 
 class AnimeToki : AnimeHttpSource() {
 
@@ -32,12 +39,17 @@ class AnimeToki : AnimeHttpSource() {
 
     override val client = network.client.newBuilder()
         .addInterceptor(SessionWarmUpInterceptor())
+        // Drive folder listings can take ~1min server-side to generate.
+        .readTimeout(60, TimeUnit.SECONDS)
         .build()
 
     override fun headersBuilder(): okhttp3.Headers.Builder = okhttp3.Headers.Builder()
         .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0")
 
     private val cloudExtractor by lazy { CloudExtractor(client, headers) }
+
+    // Bounds concurrent worker-folder fetches (folder trees are walked in parallel).
+    private val workerFetchSemaphore = Semaphore(5)
 
     // ============================== Popular ===============================
     override fun popularAnimeRequest(page: Int): Request {
@@ -193,28 +205,38 @@ class AnimeToki : AnimeHttpSource() {
     override fun seasonListParse(response: Response): List<SAnime> = throw UnsupportedOperationException()
     override fun hosterListParse(response: Response): List<Hoster> = throw UnsupportedOperationException()
 
-    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
+    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> = coroutineScope {
         val document = client.get(baseUrl + anime.url, headers).use { it.asJsoup() }
-        val episodes = mutableListOf<SEpisode>()
 
         val cloudLinks = document.select("a[href*=\"cloud.animetoki.com\"], a[href*=\"drive.animetoki.com\"]")
             .distinctBy { it.attr("href") }
-        cloudLinks.forEach { link ->
-            val attrHref = link.attr("href")
-            val href = if (attrHref.startsWith("//")) "https:$attrHref" else attrHref
-            val parsedUrl = href.toHttpUrlOrNull() ?: return@forEach
-            if (parsedUrl.scheme == "https" && (parsedUrl.host == "cloud.animetoki.com" || parsedUrl.host == "drive.animetoki.com")) {
-                val text = link.text()
-                episodes.addAll(cloudExtractor.getEpisodesFromCloudUrl(parsedUrl.toString(), text))
+            .mapNotNull { link ->
+                val attrHref = link.attr("href")
+                val href = if (attrHref.startsWith("//")) "https:$attrHref" else attrHref
+                val parsedUrl = href.toHttpUrlOrNull() ?: return@mapNotNull null
+                if (parsedUrl.scheme == "https" && (parsedUrl.host == "cloud.animetoki.com" || parsedUrl.host == "drive.animetoki.com")) {
+                    parsedUrl.toString() to link.text()
+                } else {
+                    null
+                }
             }
-        }
+        val cloudEpisodes = cloudLinks.map { (url, text) ->
+            async {
+                try {
+                    cloudExtractor.getEpisodesFromCloudUrl(url, text)
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    Log.e("AnimeToki", "Error fetching cloud episodes: $url", e)
+                    emptyList()
+                }
+            }
+        }.awaitAll().flatten()
 
         val cdnLinks = document.select("a.shortc-button[href]").filterNot {
             val href = it.attr("href")
             href.contains("cloud.animetoki.com") || href.contains("drive.animetoki.com")
         }.distinctBy { it.attr("href") }
-        var epNum = 1
-        cdnLinks.forEach { link ->
+        val workerFolders = cdnLinks.mapNotNull { link ->
             val attrHref = link.attr("href")
             val href = if (attrHref.startsWith("//")) {
                 "https:$attrHref"
@@ -223,14 +245,35 @@ class AnimeToki : AnimeHttpSource() {
             } else {
                 link.absUrl("href")
             }
-            val parsedUrl = href.toHttpUrlOrNull() ?: return@forEach
-            if (parsedUrl.scheme != "https" && parsedUrl.scheme != "http") return@forEach
+            val parsedUrl = href.toHttpUrlOrNull() ?: return@mapNotNull null
+            if (parsedUrl.scheme != "https" && parsedUrl.scheme != "http") return@mapNotNull null
+            Triple(parsedUrl, href, link.text())
+        }
+        val workerEpisodes = workerFolders.map { (parsedUrl, href, text) ->
+            async {
+                try {
+                    val path = parsedUrl.encodedPath
+                    if (parsedUrl.host.endsWith(".workers.dev") && (path.endsWith("/") || href.endsWith("/"))) {
+                        fetchWorkerEpisodes(parsedUrl.toString(), text)
+                    } else {
+                        emptyList()
+                    }
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    Log.e("AnimeToki", "Error fetching worker episodes: $href", e)
+                    emptyList()
+                }
+            }
+        }.awaitAll().flatten()
 
-            val text = link.text()
+        val episodes = (cloudEpisodes + workerEpisodes).toMutableList()
+        var epNum = 1
+        workerFolders.forEach { (parsedUrl, href, text) ->
             val path = parsedUrl.encodedPath
-            if (parsedUrl.host.endsWith(".workers.dev") && (path.endsWith("/") || href.endsWith("/"))) {
-                episodes.addAll(fetchWorkerEpisodes(parsedUrl.toString(), text))
-            } else if (path.endsWith(".mkv") || path.endsWith(".mp4") || path.endsWith(".webm") || path.endsWith(".avi") || parsedUrl.queryParameter("a") == "view") {
+            val isWorkerFolder = parsedUrl.host.endsWith(".workers.dev") && (path.endsWith("/") || href.endsWith("/"))
+            if (!isWorkerFolder &&
+                (path.endsWith(".mkv") || path.endsWith(".mp4") || path.endsWith(".webm") || path.endsWith(".avi") || parsedUrl.queryParameter("a") == "view")
+            ) {
                 episodes.add(
                     SEpisode.create().apply {
                         this.url = parsedUrl.toString()
@@ -250,54 +293,79 @@ class AnimeToki : AnimeHttpSource() {
                 episode.episode_number = fallbackNum++
             }
         }
-        return episodes.reversed()
+        episodes.reversed()
     }
 
-    private suspend fun fetchWorkerEpisodes(folderUrl: String, prefix: String = "", epCounter: FloatArray = floatArrayOf(1f)): List<SEpisode> {
-        val folderParsed = folderUrl.toHttpUrlOrNull() ?: return emptyList()
+    private suspend fun fetchWorkerEpisodes(folderUrl: String, prefix: String = ""): List<SEpisode> = fetchWorkerTree(folderUrl, prefix)
+        .sortedWith { a, b -> naturalCompare(a.name, b.name) }
+        .mapIndexed { index, episode -> episode.apply { episode_number = (index + 1).toFloat() } }
+
+    private suspend fun fetchWorkerTree(folderUrl: String, prefix: String): List<SEpisode> = coroutineScope {
+        val folderParsed = folderUrl.toHttpUrlOrNull() ?: return@coroutineScope emptyList()
         if (folderParsed.scheme != "https" || !folderParsed.host.endsWith(".workers.dev")) {
-            return emptyList()
+            return@coroutineScope emptyList()
         }
-        val episodes = mutableListOf<SEpisode>()
-        try {
-            val doc = client.get(folderUrl, headers).use { it.asJsoup() }
-            val folderRoot = folderParsed.encodedPath.substringBefore("/0:/") + if (folderParsed.encodedPath.contains("/0:/")) "/0:/" else ""
-
-            val links = doc.select("a[href]").toList().filter { a ->
-                val href = a.attr("href")
-                href.isNotBlank() && href != "." && href != ".." && href != "../"
-            }.sortedWith { a, b -> naturalCompare(a.text(), b.text()) }
-
-            links.forEach { a ->
-                val href = a.absUrl("href")
-                val hrefParsed = href.toHttpUrlOrNull() ?: return@forEach
-
-                if (hrefParsed.scheme == "https" && hrefParsed.host == folderParsed.host && hrefParsed.encodedPath.startsWith(folderRoot)) {
-                    val path = hrefParsed.encodedPath
-                    if (href.endsWith("/")) {
-                        val newPrefix = if (prefix.isNotBlank()) "$prefix / ${a.text()}" else a.text()
-                        episodes.addAll(fetchWorkerEpisodes(href, newPrefix, epCounter))
-                    } else if (path.endsWith(".mkv") || path.endsWith(".mp4") || path.endsWith(".webm") || path.endsWith(".avi") || hrefParsed.queryParameter("a") == "view") {
-                        episodes.add(
-                            SEpisode.create().apply {
-                                this.url = href
-                                val extractedName = a.text().ifEmpty { URLDecoder.decode(href.substringAfterLast("/"), "UTF-8") }
-                                name = extractedName.replace("[AnimeToki] ", "", ignoreCase = true)
-                                    .replace("[AnimeSakura] ", "", ignoreCase = true).trim()
-                                if (prefix.isNotBlank()) {
-                                    scanlator = prefix
-                                }
-                            },
-                        )
-                    }
-                }
+        val doc = try {
+            workerFetchSemaphore.withPermit {
+                client.get(folderUrl, headers).use { it.asJsoup() }
             }
         } catch (e: Exception) {
+            if (e is CancellationException) throw e
             Log.e("AnimeToki", "Error in fetchWorkerEpisodes: $folderUrl", e)
+            return@coroutineScope emptyList()
         }
-        episodes.sortWith(Comparator { a, b -> naturalCompare(a.name, b.name) })
-        episodes.forEach { it.episode_number = epCounter[0]++ }
-        return episodes
+        val folderRoot = folderParsed.encodedPath.substringBefore("/0:/") + if (folderParsed.encodedPath.contains("/0:/")) "/0:/" else ""
+
+        val links = doc.select("a[href]").toList().filter { a ->
+            val href = a.attr("href")
+            href.isNotBlank() && href != "." && href != ".." && href != "../"
+        }.sortedWith { a, b -> naturalCompare(a.text(), b.text()) }
+
+        val videos = links.mapNotNull { a ->
+            val href = a.absUrl("href")
+            val hrefParsed = href.toHttpUrlOrNull() ?: return@mapNotNull null
+            if (hrefParsed.scheme != "https" || hrefParsed.host != folderParsed.host || !hrefParsed.encodedPath.startsWith(folderRoot)) {
+                return@mapNotNull null
+            }
+            val path = hrefParsed.encodedPath
+            if (href.endsWith("/") ||
+                (!path.endsWith(".mkv") && !path.endsWith(".mp4") && !path.endsWith(".webm") && !path.endsWith(".avi") && hrefParsed.queryParameter("a") != "view")
+            ) {
+                return@mapNotNull null
+            }
+            SEpisode.create().apply {
+                this.url = href
+                val extractedName = a.text().ifEmpty { URLDecoder.decode(href.substringAfterLast("/"), "UTF-8") }
+                name = extractedName.replace("[AnimeToki] ", "", ignoreCase = true)
+                    .replace("[AnimeSakura] ", "", ignoreCase = true).trim()
+                if (prefix.isNotBlank()) {
+                    scanlator = prefix
+                }
+            }
+        }
+
+        val subfolders = links.mapNotNull { a ->
+            val href = a.absUrl("href")
+            val hrefParsed = href.toHttpUrlOrNull() ?: return@mapNotNull null
+            if (hrefParsed.scheme == "https" && hrefParsed.host == folderParsed.host && hrefParsed.encodedPath.startsWith(folderRoot) && href.endsWith("/")) {
+                val newPrefix = if (prefix.isNotBlank()) "$prefix / ${a.text()}" else a.text()
+                href to newPrefix
+            } else {
+                null
+            }
+        }.map { (href, newPrefix) ->
+            async {
+                try {
+                    fetchWorkerTree(href, newPrefix)
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    Log.e("AnimeToki", "Error traversing worker folder: $href", e)
+                    emptyList()
+                }
+            }
+        }.awaitAll().flatten()
+
+        videos + subfolders
     }
 
     // ========================= Hosters & Videos =========================
