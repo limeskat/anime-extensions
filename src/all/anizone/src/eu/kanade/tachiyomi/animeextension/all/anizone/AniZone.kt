@@ -16,12 +16,12 @@ import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Track
 import eu.kanade.tachiyomi.animesource.model.Video
+import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.awaitSuccess
-import eu.kanade.tachiyomi.network.interceptor.rateLimit
 import eu.kanade.tachiyomi.util.asJsoup
-import keiyoushi.utils.AnimeHttpHosterSource
+import keiyoushi.network.rateLimit
 import keiyoushi.utils.firstInstance
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
@@ -41,7 +41,7 @@ import org.jsoup.nodes.Element
 import org.jsoup.parser.Parser
 
 class AniZone :
-    AnimeHttpHosterSource(),
+    AnimeHttpSource(),
     ConfigurableAnimeSource {
 
     override val name = "AniZone"
@@ -288,6 +288,8 @@ class AniZone :
 
     // ============================== Episodes ==============================
 
+    override fun seasonListParse(response: Response) = throw UnsupportedOperationException()
+
     override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
         snapShots[EPISODE_SNAPSHOT_KEY] = ""
         val response = client.newCall(GET(baseUrl + anime.url, headers)).awaitSuccess()
@@ -477,11 +479,8 @@ class AniZone :
             val combinedData = "$urlPath###$videoId###$isDefault"
 
             Hoster(
-                hosterUrl = "",
                 hosterName = hosterName,
-                videoList = null,
                 internalData = combinedData,
-                lazy = false,
             )
         }
     }
