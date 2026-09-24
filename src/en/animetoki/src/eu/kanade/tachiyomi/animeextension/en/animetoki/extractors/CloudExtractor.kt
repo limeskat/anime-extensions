@@ -5,20 +5,22 @@ import android.util.Log
 import eu.kanade.tachiyomi.animeextension.en.animetoki.CloudFileResponse
 import eu.kanade.tachiyomi.animeextension.en.animetoki.naturalCompare
 import eu.kanade.tachiyomi.animesource.model.SEpisode
-import eu.kanade.tachiyomi.network.POST
-import kotlinx.serialization.decodeFromString
-import kotlinx.serialization.json.Json
+import keiyoushi.utils.get
+import keiyoushi.utils.parseAs
+import keiyoushi.utils.post
+import kotlinx.coroutines.delay
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.Headers
 import okhttp3.OkHttpClient
 import java.net.URLDecoder
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.time.Duration.Companion.milliseconds
 
 class CloudExtractor(private val client: OkHttpClient, private val headers: Headers) {
 
-    private val json = Json { ignoreUnknownKeys = true }
-    private val initializedHosts = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val initializedHosts = ConcurrentHashMap.newKeySet<String>()
 
-    fun getEpisodesFromCloudUrl(cloudUrl: String, prefix: String = ""): List<SEpisode> {
+    suspend fun getEpisodesFromCloudUrl(cloudUrl: String, prefix: String = ""): List<SEpisode> {
         val (baseUrl, segments) = splitUrl(cloudUrl)
         val initialUrl = urlToBase64(baseUrl, segments)
         val episodes = mutableListOf<SEpisode>()
@@ -26,7 +28,7 @@ class CloudExtractor(private val client: OkHttpClient, private val headers: Head
         // drive.animetoki.com requires a session cookie which is set on GET request to root domain
         if (baseUrl.contains("drive.animetoki.com") && initializedHosts.add(baseUrl)) {
             try {
-                client.newCall(eu.kanade.tachiyomi.network.GET("$baseUrl/", headers)).execute().close()
+                client.get("$baseUrl/", headers).close()
             } catch (e: Exception) {
                 Log.e("AnimeToki", "Failed preliminary GET for session cookie: $baseUrl/", e)
             }
@@ -75,25 +77,25 @@ class CloudExtractor(private val client: OkHttpClient, private val headers: Head
         }
     }
 
-    private fun traverseFolder(baseUrl: String, folderUrl: String, episodes: MutableList<SEpisode>, epCounter: FloatArray, prefix: String = "") {
+    private suspend fun traverseFolder(baseUrl: String, folderUrl: String, episodes: MutableList<SEpisode>, epCounter: FloatArray, prefix: String = "") {
         var responseBody: String? = null
         try {
             for (i in 1..3) {
                 try {
-                    client.newCall(POST(folderUrl, headers)).execute().use { response ->
+                    client.post(folderUrl, headers).use { response ->
                         if (response.isSuccessful) {
                             val body = response.body.string()
-                            if (body.startsWith("{")) {
+                            if (body.trimStart().startsWith("{")) {
                                 responseBody = body
                                 break
                             } else if (i < 3 && baseUrl.contains("drive.animetoki.com")) {
-                                client.newCall(eu.kanade.tachiyomi.network.GET("$baseUrl/", headers)).execute().close()
+                                client.get("$baseUrl/", headers).close()
                             }
                         }
                     }
                 } catch (e: Exception) {
                     if (i == 3) throw e
-                    Thread.sleep(1000)
+                    delay(1000.milliseconds)
                 }
             }
             if (responseBody.isNullOrEmpty()) {
@@ -101,14 +103,10 @@ class CloudExtractor(private val client: OkHttpClient, private val headers: Head
                 return
             }
 
-            val responseObj = json.decodeFromString<CloudFileResponse>(responseBody)
+            val responseObj = responseBody.parseAs<CloudFileResponse>()
             val nodeIndex = responseObj.nodeIndex?.jsonPrimitive?.content ?: ""
 
-            val sortedFiles = responseObj.files.sortedWith(
-                Comparator { a, b ->
-                    naturalCompare(a.name, b.name)
-                },
-            )
+            val sortedFiles = responseObj.files.sortedWith { a, b -> naturalCompare(a.name, b.name) }
 
             for (file in sortedFiles) {
                 if (file.actualMimeType.contains("video", ignoreCase = true)) {

@@ -5,36 +5,32 @@ import android.util.Log
 import eu.kanade.tachiyomi.animeextension.en.animetoki.extractors.CloudExtractor
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
+import eu.kanade.tachiyomi.animesource.model.Hoster
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
+import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.util.asJsoup
-import keiyoushi.utils.ParsedAnimeHttpLegacySource
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
+import keiyoushi.utils.get
+import keiyoushi.utils.parseAs
+import keiyoushi.utils.post
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
-import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import uy.kohesive.injekt.injectLazy
-import java.lang.UnsupportedOperationException
 import java.net.URLDecoder
+import java.text.Normalizer
 
-class AnimeToki : ParsedAnimeHttpLegacySource() {
+class AnimeToki : AnimeHttpSource() {
 
     override val name = "AnimeToki"
     override val baseUrl = "https://animetoki.com"
     override val lang = "en"
     override val supportsLatest = true
 
-    override val client = network.cloudflareClient.newBuilder()
+    override val client = network.client.newBuilder()
         .addInterceptor(SessionWarmUpInterceptor())
         .build()
 
@@ -42,7 +38,6 @@ class AnimeToki : ParsedAnimeHttpLegacySource() {
         .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0")
 
     private val cloudExtractor by lazy { CloudExtractor(client, headers) }
-    private val json: Json by injectLazy()
 
     // ============================== Popular ===============================
     override fun popularAnimeRequest(page: Int): Request {
@@ -57,15 +52,15 @@ class AnimeToki : ParsedAnimeHttpLegacySource() {
         return GET(url.toString(), headers)
     }
 
-    override fun popularAnimeSelector() = "li.post-item:has(a)"
+    private fun popularAnimeSelector() = "li.post-item:has(a)"
 
-    override fun popularAnimeFromElement(element: Element): SAnime = SAnime.create().apply {
+    private fun popularAnimeFromElement(element: Element): SAnime = SAnime.create().apply {
         val link = element.selectFirst(".post-title a, h2 a, h3 a, a.post-thumb, a[aria-label]") ?: element.selectFirst("a")
         if (link != null) {
             val href = link.attr("href")
             setUrlWithoutDomain(if (href.startsWith("http") || href.startsWith("/")) href else "/$href")
-            title = element.selectFirst(".post-title")?.text()?.trim()
-                ?: link.attr("aria-label").ifEmpty { link.text().trim() }
+            title = element.selectFirst(".post-title")?.text()
+                ?: link.attr("aria-label").ifEmpty { link.text() }
         } else {
             setUrlWithoutDomain("")
             title = ""
@@ -73,7 +68,7 @@ class AnimeToki : ParsedAnimeHttpLegacySource() {
         thumbnail_url = extractImageUrl(element.selectFirst("img")) ?: DEFAULT_COVER
     }
 
-    override fun popularAnimeNextPageSelector() = "a.load-more-button, a.next.page-numbers, .pages-nav a"
+    private fun popularAnimeNextPageSelector() = "a.load-more-button, a.next.page-numbers, .pages-nav a"
 
     override fun popularAnimeParse(response: Response): AnimesPage {
         val document = response.asJsoup()
@@ -108,9 +103,12 @@ class AnimeToki : ParsedAnimeHttpLegacySource() {
         return GET(url.toString(), headers)
     }
 
-    override fun latestUpdatesSelector() = "li.post-item:has(a)"
-    override fun latestUpdatesFromElement(element: Element) = popularAnimeFromElement(element)
-    override fun latestUpdatesNextPageSelector() = popularAnimeNextPageSelector()
+    override fun latestUpdatesParse(response: Response): AnimesPage {
+        val document = response.asJsoup()
+        val animes = document.select("li.post-item:has(a)").map { popularAnimeFromElement(it) }
+        val hasNextPage = document.selectFirst(popularAnimeNextPageSelector()) != null
+        return AnimesPage(animes, hasNextPage)
+    }
 
     // =============================== Search ===============================
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
@@ -140,38 +138,44 @@ class AnimeToki : ParsedAnimeHttpLegacySource() {
         return GET(url.toString(), headers)
     }
 
-    override fun searchAnimeSelector() = popularAnimeSelector()
-    override fun searchAnimeFromElement(element: Element) = popularAnimeFromElement(element)
-    override fun searchAnimeNextPageSelector() = popularAnimeNextPageSelector()
+    override fun searchAnimeParse(response: Response): AnimesPage {
+        val document = response.asJsoup()
+        val animes = document.select(popularAnimeSelector()).map { popularAnimeFromElement(it) }
+        val hasNextPage = document.selectFirst(popularAnimeNextPageSelector()) != null
+        return AnimesPage(animes, hasNextPage)
+    }
 
     // =========================== Anime Details ============================
-    override fun animeDetailsParse(document: Document): SAnime = SAnime.create().apply {
-        title = document.selectFirst("h1.post-title.entry-title")?.text()?.trim() ?: ""
-        thumbnail_url = extractImageUrl(document.selectFirst("figure.single-featured-image img, meta[property=\"og:image\"]"))
-            ?: DEFAULT_COVER
-        genre = document.select("span.post-cat-wrap > a.post-cat").joinToString(", ") { it.text() }
-        val descBuilder = StringBuilder()
+    override fun animeDetailsParse(response: Response): SAnime {
+        val document = response.asJsoup()
+        return SAnime.create().apply {
+            title = document.selectFirst("h1.post-title.entry-title")!!.text()
+            thumbnail_url = extractImageUrl(document.selectFirst("figure.single-featured-image img, meta[property=\"og:image\"]"))
+                ?: DEFAULT_COVER
+            genre = document.select("span.post-cat-wrap > a.post-cat").joinToString { it.text() }
+            val descBuilder = StringBuilder()
 
-        val summary = document.selectFirst(".review-short-summary")?.text()
-        if (!summary.isNullOrEmpty()) {
-            descBuilder.append(summary).append("\n\n")
-        } else {
-            document.select(".entry-content > p").forEach {
-                descBuilder.append(it.text()).append("\n\n")
+            val summary = document.selectFirst(".review-short-summary")?.text()
+            if (!summary.isNullOrEmpty()) {
+                descBuilder.append(summary).append("\n\n")
+            } else {
+                document.select(".entry-content > p").forEach {
+                    descBuilder.append(it.text()).append("\n\n")
+                }
             }
-        }
 
-        val infoHtml = document.selectFirst("div.toggle-content")?.html() ?: ""
-        if (infoHtml.isNotEmpty()) {
-            val infoText = infoHtml.replace("(?i)<br[^>]*>".toRegex(), "\n").replace(Regex("<[^>]*>"), "").trim()
-            descBuilder.append(infoText)
-        }
-        description = descBuilder.toString().trim()
+            val infoHtml = document.selectFirst("div.toggle-content")?.html() ?: ""
+            if (infoHtml.isNotEmpty()) {
+                val infoText = infoHtml.replace(BR_REGEX, "\n").replace(TAG_REGEX, "").trim()
+                descBuilder.append(infoText)
+            }
+            description = descBuilder.toString().trim()
 
-        val normalizedInfoHtml = java.text.Normalizer.normalize(infoHtml, java.text.Normalizer.Form.NFKD)
-        status = parseStatus(normalizedInfoHtml)
-        author = Regex("(?i)studios?\\s*[\\p{Punct}⋩]*\\s*(.*?)(?:<br>|$)").find(normalizedInfoHtml)?.groupValues?.get(1)?.replace(Regex("<.*?>"), "")?.replace("⋩", "")?.trim()
-        initialized = true
+            val normalizedInfoHtml = Normalizer.normalize(infoHtml, Normalizer.Form.NFKD)
+            status = parseStatus(normalizedInfoHtml)
+            author = STUDIO_REGEX.find(normalizedInfoHtml)?.groupValues?.get(1)?.replace(TAG_REGEX, "")?.replace("⋩", "")?.trim()
+            initialized = true
+        }
     }
 
     private fun parseStatus(text: String): Int {
@@ -184,8 +188,13 @@ class AnimeToki : ParsedAnimeHttpLegacySource() {
     }
 
     // ============================== Episodes ==============================
-    override fun episodeListParse(response: Response): List<SEpisode> {
-        val document = response.asJsoup()
+    // Fetched via getEpisodeList below (suspend network calls can't live in episodeListParse).
+    override fun episodeListParse(response: Response): List<SEpisode> = throw UnsupportedOperationException()
+    override fun seasonListParse(response: Response): List<SAnime> = throw UnsupportedOperationException()
+    override fun hosterListParse(response: Response): List<Hoster> = throw UnsupportedOperationException()
+
+    override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
+        val document = client.get(baseUrl + anime.url, headers).use { it.asJsoup() }
         val episodes = mutableListOf<SEpisode>()
 
         val cloudLinks = document.select("a[href*=\"cloud.animetoki.com\"], a[href*=\"drive.animetoki.com\"]")
@@ -195,7 +204,7 @@ class AnimeToki : ParsedAnimeHttpLegacySource() {
             val href = if (attrHref.startsWith("//")) "https:$attrHref" else attrHref
             val parsedUrl = href.toHttpUrlOrNull() ?: return@forEach
             if (parsedUrl.scheme == "https" && (parsedUrl.host == "cloud.animetoki.com" || parsedUrl.host == "drive.animetoki.com")) {
-                val text = link.text().trim()
+                val text = link.text()
                 episodes.addAll(cloudExtractor.getEpisodesFromCloudUrl(parsedUrl.toString(), text))
             }
         }
@@ -244,14 +253,14 @@ class AnimeToki : ParsedAnimeHttpLegacySource() {
         return episodes.reversed()
     }
 
-    private fun fetchWorkerEpisodes(folderUrl: String, prefix: String = "", epCounter: FloatArray = floatArrayOf(1f)): List<SEpisode> {
+    private suspend fun fetchWorkerEpisodes(folderUrl: String, prefix: String = "", epCounter: FloatArray = floatArrayOf(1f)): List<SEpisode> {
         val folderParsed = folderUrl.toHttpUrlOrNull() ?: return emptyList()
         if (folderParsed.scheme != "https" || !folderParsed.host.endsWith(".workers.dev")) {
             return emptyList()
         }
         val episodes = mutableListOf<SEpisode>()
         try {
-            val doc = client.newCall(GET(folderUrl, headers)).execute().use { it.asJsoup() }
+            val doc = client.get(folderUrl, headers).use { it.asJsoup() }
             val folderRoot = folderParsed.encodedPath.substringBefore("/0:/") + if (folderParsed.encodedPath.contains("/0:/")) "/0:/" else ""
 
             val links = doc.select("a[href]").toList().filter { a ->
@@ -291,25 +300,32 @@ class AnimeToki : ParsedAnimeHttpLegacySource() {
         return episodes
     }
 
-    override fun episodeListSelector(): String = throw UnsupportedOperationException("Not used")
-    override fun episodeFromElement(element: Element): SEpisode = throw UnsupportedOperationException("Not used")
+    // ========================= Hosters & Videos =========================
+    override suspend fun getHosterList(episode: SEpisode): List<Hoster> {
+        // Episode urls are already direct stream/download urls, no hoster page to scrape.
+        return listOf(
+            Hoster(
+                hosterName = episode.name,
+                internalData = episode.url,
+            ),
+        )
+    }
 
-    // ============================ Video Links =============================
-    override suspend fun getVideoList(episode: SEpisode): List<Video> {
-        val url = episode.url
-        val quality = episode.name
+    override suspend fun getVideoList(hoster: Hoster): List<Video> {
+        val url = hoster.internalData
+        val quality = hoster.hosterName
         return if (url.contains("cloud.animetoki.com") || url.contains("drive.animetoki.com")) {
-            listOf(Video(url, quality, url, getVideoHeaders(url)))
+            listOf(Video(videoUrl = url, videoTitle = quality, headers = getVideoHeaders(url)))
         } else if (url.contains("workers.dev")) {
             val resolvedUrl = resolveWorkerUrl(url)
-            listOf(Video(resolvedUrl, quality, resolvedUrl, getVideoHeaders(resolvedUrl)))
+            listOf(Video(videoUrl = resolvedUrl, videoTitle = quality, headers = getVideoHeaders(resolvedUrl)))
         } else {
             val cleanUrl = try {
                 url.toHttpUrl().newBuilder().removeAllQueryParameters("a").build().toString()
             } catch (e: Exception) {
                 url
             }
-            listOf(Video(cleanUrl, quality, cleanUrl, getVideoHeaders(cleanUrl)))
+            listOf(Video(videoUrl = cleanUrl, videoTitle = quality, headers = getVideoHeaders(cleanUrl)))
         }
     }
 
@@ -326,7 +342,7 @@ class AnimeToki : ParsedAnimeHttpLegacySource() {
         return builder.build()
     }
 
-    private fun resolveWorkerUrl(url: String): String {
+    private suspend fun resolveWorkerUrl(url: String): String {
         return try {
             val parsed = url.toHttpUrl()
             if (!parsed.host.contains("workers.dev")) {
@@ -343,25 +359,18 @@ class AnimeToki : ParsedAnimeHttpLegacySource() {
                 .addQueryParameter("a", "view")
                 .build()
 
-            client.newCall(POST(parentUrl.toString(), headers, ByteArray(0).toRequestBody(null))).execute().use { postResponse ->
-                val responseBody = postResponse.body.string()
-                val files = json.parseToJsonElement(responseBody).jsonObject["files"]?.jsonArray ?: return url
-
-                files.forEach { file ->
-                    val f = file.jsonObject
-                    val name = f["name"]?.jsonPrimitive?.content
-                    if (name == fileName) {
-                        val fileId = f["id"]?.jsonPrimitive?.content ?: return@forEach
-                        val encodedName = Base64.encodeToString(fileName.toByteArray(), Base64.DEFAULT or Base64.NO_WRAP)
-                        return parsed.newBuilder()
-                            .encodedPath("/")
-                            .query(null)
-                            .addQueryParameter("a", "download")
-                            .addQueryParameter("id", fileId)
-                            .addQueryParameter("name", encodedName)
-                            .fragment(fileName)
-                            .build().toString()
-                    }
+            val files = client.post(parentUrl.toString(), headers).parseAs<WorkerFileResponse>().files
+            files.forEach { file ->
+                if (file.name == fileName) {
+                    val encodedName = Base64.encodeToString(fileName.toByteArray(), Base64.DEFAULT or Base64.NO_WRAP)
+                    return parsed.newBuilder()
+                        .encodedPath("/")
+                        .query(null)
+                        .addQueryParameter("a", "download")
+                        .addQueryParameter("id", file.id)
+                        .addQueryParameter("name", encodedName)
+                        .fragment(fileName)
+                        .build().toString()
                 }
             }
             url
@@ -391,5 +400,8 @@ class AnimeToki : ParsedAnimeHttpLegacySource() {
 
     companion object {
         private const val DEFAULT_COVER = "https://animetoki.com/wp-content/uploads/2025/04/cropped-img_20250430_220309281.webp"
+        private val BR_REGEX = "(?i)<br[^>]*>".toRegex()
+        private val TAG_REGEX = Regex("<[^>]*>")
+        private val STUDIO_REGEX = Regex("(?i)studios?\\s*[\\p{Punct}⋩]*\\s*(.*?)(?:<br>|$)")
     }
 }
