@@ -80,7 +80,7 @@ class AnimeToki : AnimeHttpSource() {
         thumbnail_url = extractImageUrl(element.selectFirst("img")) ?: DEFAULT_COVER
     }
 
-    private fun popularAnimeNextPageSelector() = "a.load-more-button, a.next.page-numbers, .pages-nav a"
+    private fun popularAnimeNextPageSelector() = ".pages-nav .last-page a"
 
     override fun popularAnimeParse(response: Response): AnimesPage {
         val document = response.asJsoup()
